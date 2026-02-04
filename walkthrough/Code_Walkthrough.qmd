@@ -1,0 +1,1224 @@
+---
+title: "Patient Churn Prediction Project"
+author: "Alex Farina, Sam Brothers, Pooja Muthuraj, Ashley Gasswint"
+date: "03December2025"
+format: pdf
+---
+# TEAM SUMMARY
+The model confirms that churn is primarily driven by life stage and socioeconomic instability, not by clinical or appointment-keeping behavior alone.
+
+The difference between the highest-risk group (Age 65+) and the lowest-risk group (Spanish/Other Language speakers) spans a massive range, from a 74.9% churn likelihood down to a 6.7% likelihood.
+
+Top Churn Drivers:
+
+1. Extreme Age Risk
+  - Age is the dominant predictor. The jump from the baseline (18-19) to the 65+ group (risk of 74.9%) is quite severe 
+  - Could necessitates specialized senior care engagement to address mobility, health literacy, and social isolation barriers.
+
+2. Socioeconomic Instability
+  - Housing and employment uncertainty double the odds of churn. Patients who are Homeless, Lives With Others, Self Employed, or Unemployed are struggling with basic needs, making their clinic appointments or overall a lower priority over other needs.
+
+Top Retention Factors:
+
+1. Language Services Success
+  - Patients speaking Spanish or "Other" languages are highly retained. Their churn risk drops significantly (~7% to 8% absolute risk).
+
+2. Chronic Care Engagement
+  - Patients with a Chronic Diagnosis are less likely to churn. Their ongoing health needs may foster stronger clinic relationships and appointment adherence.
+
+# 1. SETUP
+## 1.1 Load Packages
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(fastDummies)
+library(ISLR2)
+library(class)
+library(zipcodeR)
+library(geosphere)
+library(pROC)
+library(caret)
+library(MASS)
+```
+
+## 1.2 Load data
+
+```{r}
+people <- read_csv("people.csv", show_col_types = FALSE)
+encounters <- read_csv("encounters.csv", show_col_types = FALSE)
+enrollment <- read_csv("enrollment.csv", show_col_types = FALSE)
+noshow <- read_csv("noshow.csv", show_col_types = FALSE)
+observations <- read_csv("observations.csv", show_col_types = FALSE)
+diagnosis <- read_csv("diagnosis.csv", show_col_types = FALSE)
+orders <- read_csv("orders.csv", show_col_types = FALSE)
+residence <- read_csv("residence.csv", show_col_types = FALSE)
+```
+
+## 1.3 Set Reference Date for Reproducibility
+CRITICAL: Use fixed date (when data was received), NOT Sys.Date()
+This ensures everyone gets the same results.
+
+```{r}
+reference_date <- as.Date("2025-09-30")  # End of September 2025
+
+cat(sprintf("📅 Reference date: %s (data receipt/extraction date)\n", 
+            reference_date))
+cat("   All 'days since' calculations will use this date.\n\n")
+```
+
+# 2. DEFINE THE CHURN VARIABLE
+CRITICAL: Choose ONE approach and document your rationale
+Goal: CHURN = (No Completed Encounter in 365 days) OR (Disenrolled Status)
+
+## 2.1 Identify the encounter date column dynamically
+```{r}
+enc_date_col <- names(encounters)[grepl("date|datetime|time", names(encounters), 
+                                        ignore.case = TRUE)][1]
+```
+
+## 2.2: Encounter-Based Churn (365-day Gap)
+- CRITICAL: Convert to Date format <br>
+- CRITICAL: Filter for only 'Completed' encounters (Active care)
+- Filter out data that occurred AFTER our analysis date (no look-ahead)
+- FLAG 1: Churned if last completed encounter was more than 365 days ago
+
+```{r}
+churn_encounter_flag <- encounters %>%
+  mutate(enc_date = as.Date(.data[[enc_date_col]])) %>%
+  filter(enc_status == "Completed") %>%
+  filter(enc_date <= reference_date) %>% 
+  group_by(mrn_pseudo) %>%
+  summarize(
+    last_completed_encounter = max(enc_date, na.rm = TRUE),
+    days_since_completed_enc = as.numeric(
+      reference_date - last_completed_encounter),
+    .groups = "drop"
+  ) %>%
+  mutate( 
+    churn_enc_flag = if_else(days_since_completed_enc > 365, 1, 0, missing = 1)
+  )
+```
+
+## 2.3: Final Fix
+Select the columns outside the pipe using Base R indexing
+
+```{r}
+churn_encounter_flag <- churn_encounter_flag[ , c("mrn_pseudo", "churn_enc_flag")]
+```
+
+## 2.4: Enrollment-Based Churn (Disenrolled Status)
+- Filter for records that explicitly mark the patient as 'Disenrolled'
+- Only count disenrolled status if the event occurred BEFORE or AT the reference date
+- FLAG 2: Churned if the patient has *ever* been formally disenrolled
+
+```{r}
+churn_disenrolled_flag <- enrollment %>% 
+  filter(enr_status == "Disenrolled") %>%
+  filter(as.Date(enr_start) <= reference_date) %>% 
+  group_by(mrn_pseudo) %>%
+  summarize(
+    churn_disenr_flag = 1,
+    .groups = "drop"
+  )
+```
+## 2.5: Removing the simple churn_encounter object from the old code if it still exists
+
+```{r}
+if(exists("churn_encounter")) rm(churn_encounter)
+```
+
+# 3. CREATE PATIENT-LEVEL SUMMARIES
+## 3.1: Enrollment summary 
+- Use if() instead of if_else() to avoid warnings
+
+```{r}
+if ("enr_start" %in% names(enrollment) && "enr_exp" %in% names(enrollment)) {
+  enrollment_summary <- enrollment %>%
+    filter(enr_start <= enr_exp | is.na(enr_start) | is.na(enr_exp)) %>%
+    group_by(mrn_pseudo) %>%
+    summarize(
+      total_enrollments = n(),
+      first_enrollment = if(all(is.na(enr_start))) as.Date(NA_character_) 
+      else min(enr_start, na.rm = TRUE),
+      last_enrollment_end = if(all(is.na(enr_exp))) as.Date(NA_character_) 
+      else max(enr_exp, na.rm = TRUE),
+      total_enrollment_days = sum(as.numeric(enr_exp - enr_start), na.rm = TRUE),
+      currently_enrolled = if(all(is.na(enr_exp))) 
+        FALSE else max(enr_exp, na.rm = TRUE) >= reference_date,
+      .groups = "drop"
+    )
+}
+```
+
+## 3.2: Encounters summary 
+- Handles different date column names
+
+```{r}
+enc_date_col <- names(encounters)[grepl("date|datetime|time", 
+                                        names(encounters), ignore.case = TRUE)]
+
+if (length(enc_date_col) > 0 && inherits(encounters[[enc_date_col[1]]], 
+                                         c("Date", "POSIXct", "POSIXt"))) {
+  enc_date_col <- enc_date_col[1]
+  
+ if ("telehealth" %in% names(encounters)) {
+       encounters_summary <- encounters %>%
+      group_by(mrn_pseudo) %>%
+      summarize(
+        total_encounters = n(),
+        telehealth_count = sum(telehealth == "Yes", na.rm = TRUE),
+        telehealth_pct = mean(telehealth == "Yes", na.rm = TRUE) * 100,
+        first_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else min(.data[[enc_date_col]], na.rm = TRUE),
+        last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else max(.data[[enc_date_col]], na.rm = TRUE),
+        days_since_last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          NA_real_ else as.numeric(reference_date - max(.data[[enc_date_col]], 
+                                                        na.rm = TRUE)),
+        visits_in_past_year = sum(
+          !is.na(.data[[enc_date_col]]) &
+            .data[[enc_date_col]] >= (reference_date - 365) &
+            .data[[enc_date_col]] <= reference_date
+        ),
+        .groups = "drop"
+      )
+  } else if ("enc_is_teleh" %in% names(encounters)) {
+    # enc_is_teleh = 0/1
+    encounters_summary <- encounters %>%
+      group_by(mrn_pseudo) %>%
+      summarize(
+        total_encounters = n(),
+        telehealth_count = sum(enc_is_teleh == 1, na.rm = TRUE),
+        telehealth_pct = mean(enc_is_teleh == 1, na.rm = TRUE) * 100,
+        first_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else min(.data[[enc_date_col]], na.rm = TRUE),
+        last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else max(.data[[enc_date_col]], na.rm = TRUE),
+        days_since_last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          NA_real_ else as.numeric(reference_date - max(.data[[enc_date_col]], 
+                                                        na.rm = TRUE)),
+        visits_in_past_year = sum(
+          !is.na(.data[[enc_date_col]]) &
+            .data[[enc_date_col]] >= (reference_date - 365) &
+            .data[[enc_date_col]] <= reference_date
+        ),
+        .groups = "drop"
+      )
+  } else {
+    encounters_summary <- encounters %>%
+      group_by(mrn_pseudo) %>%
+      summarize(
+        total_encounters = n(),
+        first_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else min(.data[[enc_date_col]], na.rm = TRUE),
+        last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          as.Date(NA_character_) else max(.data[[enc_date_col]], na.rm = TRUE),
+        days_since_last_visit = if(all(is.na(.data[[enc_date_col]]))) 
+          NA_real_ else as.numeric(reference_date - max(.data[[enc_date_col]], 
+                                                        na.rm = TRUE)),
+        visits_in_past_year = sum(
+          !is.na(.data[[enc_date_col]]) &
+            .data[[enc_date_col]] >= (reference_date - 365) &
+            .data[[enc_date_col]] <= reference_date
+        ),
+        .groups = "drop"
+      )
+  }
+}
+```
+
+## 3.3: No shows summary
+```{r}
+noshow_summary <- noshow %>%
+  group_by(mrn_pseudo) %>%
+  summarize(
+    total_noshows = n(),
+    .groups = "drop"
+  )
+```
+
+## 3.4: Add no show proportion
+```{r}
+noshow <- noshow %>%
+  mutate(ns_reason = str_to_title(str_to_lower(ns_reason)))
+
+noshow <- noshow %>%
+  filter(ns_reason != "Dental")
+
+ggplot(data = noshow, aes(x = ns_reason, y = after_stat(prop), group = 1)) +
+  geom_bar(fill = "lightblue") +
+  labs(title = "No Shows per Appointment Type", x = "Appointment Type", 
+       y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 4. BUILD MASTER DATASET (ONE ROW PER PATIENT)
+```{r}
+master <- people %>%
+  # Join summaries
+  left_join(enrollment_summary, by = "mrn_pseudo") %>%
+  left_join(encounters_summary, by = "mrn_pseudo") %>%
+  left_join(noshow_summary, by = "mrn_pseudo") %>%
+  # Create binary flags for sparse data
+  mutate(
+    has_observations = mrn_pseudo %in% observations$mrn_pseudo,
+    has_diagnosis = mrn_pseudo %in% diagnosis$mrn_pseudo,
+    has_noshows = !is.na(total_noshows)
+  )
+
+# Save raw version for missing data analysis
+master_raw <- master
+
+# Add chosen churn definition
+master <- master %>% 
+  left_join(churn_encounter_flag, by = "mrn_pseudo") %>%
+  left_join(churn_disenrolled_flag, by = "mrn_pseudo")
+```
+# 5. MISSING DATA ANALYSIS & HANDLING
+```{r}
+cat("\n=== MISSING DATA SUMMARY (RAW DATA) ===\n")
+
+# Calculate % missing for key variables (use RAW data)
+missing_summary <- master_raw %>%
+  summarize(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = (n_missing / nrow(master_raw)) * 100) %>%
+  filter(pct_missing > 0) %>%
+  arrange(desc(pct_missing))
+
+cat(sprintf("Variables with missing data: %d\n", nrow(missing_summary)))
+if (nrow(missing_summary) > 0) {
+  cat(sprintf("Most missing: %s (%.1f%%)\n\n", 
+              missing_summary$variable[1], 
+              missing_summary$pct_missing[1]))
+}
+
+# STRATEGY: Domain-specific defaults
+# For Lackey data, most NAs are structural (patient never had that event)
+
+master <- master %>%
+  mutate(
+    # Counts: NA means zero occurrences
+    total_encounters = replace_na(total_encounters, 0),
+    total_noshows = replace_na(total_noshows, 0),
+    total_enrollments = replace_na(total_enrollments, 0),
+    
+    # Rates/percentages: NA means 0% (or could keep as NA)
+    telehealth_pct = replace_na(telehealth_pct, 0),
+    
+    # Time features: NA means "never happened" - use sentinel value
+    days_since_last_visit = replace_na(days_since_last_visit, 9999),
+    
+    # Create indicators for structural missingness (informative!)
+    never_visited = is.na(first_visit),
+    never_enrolled = is.na(first_enrollment)
+  )
+
+cat("✓ Applied domain-specific missing data handling\n")
+cat("  • Counts → 0 (no events recorded)\n")
+cat("  • Rates → 0% (no activity)\n")
+cat("  • Time features → 9999 days (sentinel value for 'never')\n")
+cat("  • Created 'never_*' indicators\n\n")
+
+# Validation: Check remaining NAs
+remaining_na <- master %>%
+  summarize(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0)
+
+if (nrow(remaining_na) > 0) {
+  cat(sprintf("Note: %d variables still have NAs (dates, demographics)\n", 
+              nrow(remaining_na)))
+  cat("     This is expected - will derive features from dates in Part 6\n")
+  cat("     Time features (days_since_last_visit) already handled with sentinel 
+      value\n\n")
+} else {
+  cat("✓ No remaining NAs in dataset\n\n")
+}
+```
+
+# 6. FEATURE ENGINEERING
+## 6.1: Engineering part 1
+
+```{r}
+master <- master %>%
+  mutate(
+    # Transformations (for skewed distributions)
+    log_encounters = log(total_encounters + 1),  # +1 handles zeros
+    
+    # Ratios & Rates (handle division by zero)
+    noshow_rate = if_else(total_encounters > 0,
+                          total_noshows / (total_noshows + total_encounters),
+                          NA_real_),
+    
+    # Visit frequency (encounters per year of enrollment)
+    visit_frequency = if_else(total_enrollment_days > 0,
+                              (total_encounters / total_enrollment_days) * 365,
+                              NA_real_),
+    
+    # Temporal features
+    days_since_exp = if_else(!is.na(last_enrollment_end),
+                             as.numeric(reference_date - last_enrollment_end),
+                             NA_real_),
+    
+    tenure_days = if_else(!is.na(first_enrollment) & !is.na(last_enrollment_end),
+                          as.numeric(last_enrollment_end - first_enrollment),
+                          NA_real_)
+  )
+
+## drop all the family members (never_enrolled = TRUE)
+master_new <- master %>% filter(never_enrolled == FALSE)
+```
+
+## 6.2: Diagnosis code grouping examples
+- All the diagnoses with labels are considered chronic
+```{r}
+diagnosis <- diagnosis %>% mutate(chronic =
+                                    case_when(dia_dxgroup == "Other" ~ 0,
+                                              TRUE ~ 1))
+
+# join into master_new
+diagnosis_summary <- diagnosis %>%
+  group_by(mrn_pseudo) %>%
+  summarize(
+    has_chronic_diagnosis = max(chronic, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+master_new <- master_new %>%
+  left_join(diagnosis_summary, by = "mrn_pseudo") %>%
+  mutate(
+    has_chronic_diagnosis = replace_na(has_chronic_diagnosis, 0)
+  )
+
+
+## drop all the family members (never_enrolled = TRUE)
+master_new <- master_new %>% filter(never_enrolled == FALSE)
+```
+
+## 6.3: Final Churn Variable Combination
+- This replaces the old complex case_when logic
+- Fill NA churn flags with 0. 
+- This correctly handles patients who might not have an encounter/enrollment record, but were not deemed 'churned' by the initial flag creation (e.g., they exist in 'people' but nowhere else).
+
+```{r}
+master_new <- master_new %>%
+
+  mutate(
+    churn_enc_flag = replace_na(churn_enc_flag, 0),
+    churn_disenr_flag = replace_na(churn_disenr_flag, 0)
+  ) %>%
+  
+  # FINAL CHURN DEFINITION: CHURN = (Encounter Gap > 365d) OR (Disenrolled Status)
+  mutate(
+    # The pmax() function performs a logical OR: Churned (1) if EITHER flag is 1.
+    churned = pmax(churn_enc_flag, churn_disenr_flag),
+    # Convert to a clear factor for modeling
+    churned = factor(churned, levels = c(0, 1))#, labels = c("Retained", "Churned"))
+  )
+
+master_new <- master_new[ , !names(master_new) %in% c("churn_enc_flag", 
+                                                      "churn_disenr_flag")] 
+# Drop the temporary flags
+
+table(master_new$churned)
+```
+
+# 7. DATA QUALITY CHECKS
+
+```{r}
+cat("\n=== FINAL DATA QUALITY CHECKS ===\n")
+
+# Check for missing outcome on the master_new dataset
+if ("churned" %in% names(master_new)) { 
+  cat(sprintf("Missing churn labels: %d (%.1f%%)\n",
+              sum(is.na(master_new$churned)), 
+              mean(is.na(master_new$churned)) * 100))
+  
+  # Check class balance
+  master_new %>% 
+    filter(!is.na(churned)) %>%
+    count(churned) %>%
+    mutate(percentage = n / sum(n) * 100) %>%
+    print()
+} else {
+  cat("⚠️ No churn variable found - remember to add it!\n")
+}
+
+# Complete cases comparison
+cat(sprintf("\nComplete cases (CLEANED): %s / %s (%.1f%%)\n",
+            format(sum(complete.cases(master_new)), big.mark = ","),
+            format(nrow(master_new), big.mark = ","),
+            (sum(complete.cases(master_new)) / nrow(master_new)) * 100))
+
+cat(sprintf("Complete cases (CLEANED): %s / %s (%.1f%%)\n",
+            format(sum(complete.cases(master)), big.mark = ","),
+            format(nrow(master), big.mark = ","),
+            (sum(complete.cases(master)) / nrow(master)) * 100))
+
+
+cat("\n✨ Script complete! Master dataset ready for modeling.\n")
+cat(sprintf("📅 Remember: All time calculations use reference_date = %s\n", 
+            reference_date))
+
+
+age_levels <- c("Under 18", "18-19", "20-29", "30-39",
+                "40-49", "50-59", "60-64", "65+")
+master_new <- master_new %>%
+  mutate(
+    age_range = factor(
+      age_range,
+      levels = age_levels,
+      ordered = FALSE
+    )
+  )
+
+master_new <- master_new %>%
+  mutate(
+    Employment = str_to_title(Employment),
+    Employment = str_replace_all(Employment, "\\]", ")"),
+    Employment = if_else(Employment %in% c("Null", "Unknown"), 
+                         NA_character_, Employment),
+    Employment = factor(
+      Employment,
+      levels = c(
+        "Employed", "Self Employed", "Seasonal",
+        "Unemployed (Actively Looking For Work)",
+        "Not In Workforce (Choosing Not To Work)", "Retired"
+      )
+    )
+  )
+
+master_new <- master_new %>% mutate(Education = factor(
+  Education))
+
+master_new <- master_new %>%
+  mutate(
+    Housing = str_to_title(Housing),  # make capitalization consistent
+    Housing = if_else(
+      Housing %in% c("Null", "Unknown", ""), 
+      NA_character_, 
+      Housing
+    ),
+    Housing = factor(
+      Housing,
+      levels = c(
+        "Own",
+        "Rent",
+        "Lives With Others",
+        "Mobile Home",
+        "Homeless"
+      )
+    )
+  )
+
+master_new <- master_new %>%
+  mutate(
+    Language = str_to_title(Language),                
+    Language = str_trim(Language),                    
+    Language = str_replace_all(Language, "Other:", ""), 
+    Language = str_replace_all(Language, "Other", ""),  
+    Language = str_replace_all(Language, ":", ""),      
+    Language = if_else(
+      Language %in% c("Null", "Unknown", "", NA_character_), 
+      NA_character_, 
+      Language
+    ),
+    
+    # Collapse into 4 buckets
+    Language_grouped = case_when(
+      str_detect(Language, "English") ~ "English",
+      str_detect(Language, "Spanish") ~ "Spanish",
+      is.na(Language) ~ "Unknown/Missing",
+      TRUE ~ "Other"
+    ),
+    
+    # Convert to factor with clear levels
+    Language_grouped = factor(
+      Language_grouped,
+      levels = c("English", "Spanish", "Other", "Unknown/Missing")
+    )
+  )
+
+
+master_new <- master_new %>%
+  mutate(
+    has_chronic_diagnosis = factor(
+      has_chronic_diagnosis
+    )
+  )
+```
+
+# 8. FEATURE TYPES
+
+## 8.1: Demographic Features
+### 8.11 Language
+- Patients whose language differs from English, what is most likely to be spoken at lackey, may experience more difficulty with their healthcare than others, increasing chances for churn.
+- Data Issues: Way too many groups and varying notation of language spoken, so we decided to group them into 4 main categories
+
+```{r}
+language_raw_summary <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(Language)),
+    missing_pct = mean(is.na(Language)) * 100
+  )
+
+language_raw_counts <- master_new %>%
+  count(Language) %>%
+  arrange(desc(n)) %>%
+  mutate(percent = n / sum(n, na.rm = TRUE) * 100)
+
+language_raw_summary
+print(language_raw_counts, n = 39)
+
+lang_summary <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(Language_grouped)),
+    missing_pct = mean(is.na(Language_grouped)) * 100
+  )
+
+lang_counts <- master_new %>%
+  count(Language_grouped) %>%
+  mutate(percent = n / sum(n) * 100)
+
+lang_summary
+lang_counts
+```
+
+### 8.12: Housing Feature
+- Unstable housing conditions could face more issues around mobility and overall stress
+
+```{r}
+housing_summary <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(Housing)),
+    missing_pct = mean(is.na(Housing)) * 100
+  )
+
+housing_counts <- master_new %>%
+  count(Housing) %>%
+  mutate(percent = n / sum(n) * 100)
+
+housing_summary
+housing_counts
+```
+
+### 8.13: Employment Feature
+- Those unemployed may be in the process of gaining medicare/medicaid and those employed may be to busy to make it to appointments
+- Data Issues: Some small issues with ('s and ['s in notation
+
+```{r}
+employment_summary <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(Employment)),
+    missing_pct = mean(is.na(Employment)) * 100
+  )
+
+employment_counts <- master_new %>%
+  count(Employment) %>%
+  mutate(percent = n / sum(n) * 100)
+
+employment_summary
+employment_counts
+```
+
+### 8.14: Zip Code Distance Feature
+- Patients who live closer to lackey may be more likely to visit and less likely to churn. We will calculate distance from the geographical center of each county to lackey's lat and long in meter.
+
+```{r}
+ref_lat <- 37.23110133397947
+ref_lng <- -76.55492831279969
+
+residence <- residence %>% 
+  group_by(mrn_pseudo) %>%
+  slice_max(order_by = r_start, n=1, with_ties = FALSE) %>%
+  ungroup()
+
+residence$r_zip <- as.character(residence$r_zip)
+
+# Add latitude and longitude for each ZIP
+zip_lookup <- zipcodeR::zip_code_db[, c("zipcode", "lat", "lng")]
+colnames(zip_lookup)
+colnames(zip_lookup)[1] <- "r_zip"
+
+residence <- merge(residence, zip_lookup, by = "r_zip", all.x = TRUE)
+
+# Compute distance for each ZIP
+residence$distance_meters <- distHaversine(
+  cbind(residence$lng, residence$lat),
+  c(ref_lng, ref_lat)
+)
+
+# cleaning and joining
+residence_clean <- residence %>%
+  drop_na(distance_meters)
+
+residence_dist <- residence_clean
+
+residence_dist <- residence_dist[c("mrn_pseudo", "distance_meters")]
+
+master_new <- master_new %>%
+  left_join(residence_dist, by = "mrn_pseudo")
+```
+
+### 8.15 No-Show Rate Feature Summary
+- Patients with higher no-show rates may be more likely to churn, since missed appointments often indicate lower engagement or access barriers.
+
+```{r}
+noshow_summary_stats <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(noshow_rate)),
+    missing_pct = mean(is.na(noshow_rate)) * 100,
+    mean_noshow_rate = mean(noshow_rate, na.rm = TRUE),
+    median_noshow_rate = median(noshow_rate, na.rm = TRUE),
+    min_noshow_rate = min(noshow_rate, na.rm = TRUE),
+    max_noshow_rate = max(noshow_rate, na.rm = TRUE)
+  )
+
+noshow_summary_stats
+
+# Summary statistics for has_chronic_condition
+chronic_summary <- master_new %>%
+  summarise(
+    total = n(),
+    missing = sum(is.na(has_chronic_diagnosis)),
+    missing_pct = mean(is.na(has_chronic_diagnosis)) * 100
+  )
+
+# Frequency table
+chronic_counts <- master_new %>%
+  count(has_chronic_diagnosis) %>%
+  mutate(percent = n / sum(n) * 100)
+
+chronic_summary
+chronic_counts
+```
+
+# 9. CREATING TRAIN AND TEST DATA
+
+```{r}
+set.seed(123)  # for reproducibility
+
+# 70% training indices
+train_indices <- sample(seq_len(nrow(master_new)), size = 0.7 * nrow(master_new))
+
+# Split
+train_data <- master_new[train_indices, ]
+test_data  <- master_new[-train_indices, ]
+```
+
+# 10. CREATING THE MODEL 
+
+```{r}
+churn_model <- glm(
+  churned ~ Employment + has_chronic_diagnosis + noshow_rate + age_range + 
+    Housing + Language_grouped + distance_meters,
+  data = train_data,
+  family = binomial)
+
+summary(churn_model)
+
+# 1. Inspect the levels the model actually learned (optional, but informative)
+print(churn_model$xlevels$age_range)
+
+# 2. Force the factor levels in test_data to match the model's learned levels
+test_data$age_range <- factor(
+  test_data$age_range, 
+  levels = churn_model$xlevels$age_range # Use the levels stored in the trained 
+  #model
+)
+
+# Predicted probabilities
+test_data$predicted_prob <- predict(churn_model, newdata = test_data, 
+                                    type = "response")
+
+# Predicted classes using 0.5 threshold
+test_data <- test_data %>%
+  mutate(predicted_churn = if_else(predicted_prob > 0.6, 1, 0))
+
+# Confusion matrix
+table(Predicted = test_data$predicted_churn, Actual = test_data$churned)
+# Calculate accuracy
+mean(test_data$predicted_churn == test_data$churned, na.rm = TRUE)
+
+roc_obj <- roc(test_data$churned, test_data$predicted_prob)
+auc(roc_obj)
+plot(roc_obj, main = "ROC Curve for Churn Model")
+
+table(test_data$churned)
+table(master_new$churned)
+```
+
+# 11. STEPWISE GLM
+
+```{r}
+clean_data <- train_data %>%
+  na.omit()
+
+null_model <- glm(
+  churned ~ 1,
+  data = clean_data,
+  family = binomial)
+summary(null_model)
+
+full_model <- glm(
+  churned ~ Employment + has_chronic_diagnosis + noshow_rate + age_range + 
+    Housing + Language_grouped + distance_meters,
+  data = clean_data,
+  family = binomial)
+
+forward_model <- step(null_model,
+                      scope = formula(full_model),
+                      direction = "forward")
+
+backward_model <- step(null_model,
+                       scope = formula(full_model),
+                       direction = "backward")
+
+stepwise_model <- step(null_model,
+                       scope = formula(full_model),
+                       direction = "both")
+```
+
+# 12. CROSS-VALIDATING LOGISTIC REGRESSION
+
+```{r}
+set.seed(42)
+
+cv_control <- trainControl(
+  method = "cv", 
+  number = 10, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary 
+)
+
+train_data$churned <- factor(
+  train_data$churned,
+  levels = c("0", "1"),
+  labels = c("No_Churn", "Churn")
+)
+
+model_cv <- train(
+  churned ~ 
+    Employment + 
+    has_chronic_diagnosis + 
+    noshow_rate + 
+    Language_grouped +
+    Housing +
+    Education +
+    distance_meters,
+  data = train_data,
+  na.action = na.omit,
+  method = "glm",
+  family = "binomial", 
+  trControl = cv_control, 
+  metric = "ROC"
+)
+
+# cross-val summary
+
+print(model_cv)
+
+# performance metrics (10-fold cv mean)
+
+print(model_cv$results)
+```
+
+# 12. kNN MODEL
+
+```{r}
+set.seed(100)
+
+# What's our baseline accuracy if we just predict "Retained" for everyone?
+# Note: calculating based on the majority class (0/Retained)
+baseline_accuracy <- prop.table(table(master_new$churned))[1]
+cat("Baseline accuracy (always predict 'Retained'):", 
+    round(baseline_accuracy * 100, 2), "%\n")
+
+master_new_clean <- na.omit(master_new)
+
+# FIX: Convert to factor with string labels and force "Churned" (1) to be the 
+#first level.
+# This makes "Churned" the positive class by default.
+master_new_clean$churned <- factor(master_new_clean$churned, 
+                                   levels = c("1", "0"), 
+                                   labels = c("Churned", "Retained"))
+
+# Partitioning data
+trainIndex <- createDataPartition(master_new_clean$churned, p = 0.8, 
+                                  list = FALSE)
+train_data <- master_new_clean[trainIndex, ]
+test_data <- master_new_clean[-trainIndex, ]
+
+# Training model
+knndefault_acc <- train(
+  churned ~ 
+    Employment + 
+    age_range +
+    Housing +
+    Education +
+    has_chronic_diagnosis +
+    noshow_rate + 
+    distance_meters,
+  data = train_data,
+  method = "knn",
+  preProcess = c("center", "scale")
+)
+
+print(knndefault_acc)
+
+knn_predictions <- predict(knndefault_acc, newdata = test_data)
+
+# FIX: Explicitly tell the matrix that "Churned" is the positive class
+confusionMatrix(knn_predictions, test_data$churned, positive = "Churned")
+```
+ 
+# 13. CROSS-VALIDATING kNN
+
+```{r}
+set.seed(42)
+
+# Grid of k values to test
+k_grid <- expand.grid(k = seq(3, 21, by = 2))
+
+# Define Control
+# summaryFunction = twoClassSummary allows us to optimize for ROC (AUC)
+# This REQUIRES the target variable to be a factor with text labels (e.g.,
+#"Churned", "Retained")
+cv_control <- trainControl(
+  method = "cv", 
+  number = 10, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary
+)
+
+# NOTE: We assume train_data$churned is already properly formatted as 
+# "Churned" / "Retained" from the previous kNN model step.
+# "Churned" should be the first level.
+
+model_cv_knn <- train(
+  churned ~ 
+    Employment + 
+    age_range +
+    Housing +
+    Education +
+    has_chronic_diagnosis +
+    noshow_rate + 
+    distance_meters,
+  data = train_data,
+  method = "knn",
+  trControl = cv_control, 
+  tuneGrid = k_grid,  
+  metric = "ROC", # Optimizing for Area Under Curve rather than just Accuracy
+  preProcess = c("center", "scale") 
+)
+
+# kNN cross-val output (Check that Sens/Spec look correct for the "Churned" class)
+print(model_cv_knn)
+
+# The best k value found:
+print(model_cv_knn$bestTune)
+
+# Predict using the best model
+# type = "prob" gives the probability scores (needed for ROC curves)
+predictions_prob <- predict(model_cv_knn, newdata = test_data, type = "prob")
+
+# type = "raw" gives the actual class labels
+predictions_class <- predict(model_cv_knn, newdata = test_data, type = "raw")
+
+# Final Confusion Matrix on Test Data
+# positive = "Churned" ensures we are focusing on the target class correctly
+confusionMatrix(predictions_class, test_data$churned, positive = "Churned")
+```
+
+# 14. LDA
+
+```{r}
+# IMPORTANT: Ensure 'churned' is a factor before running the check
+# If your 'churned' variable is not already a factor (e.g., if it's 0/1 integer), 
+#uncomment and run:
+# train_data$churned <- as.factor(train_data$churned) 
+
+# List of categorical features from your model
+cat_features <- c("Employment", "age_range", "Housing", "Language_grouped", 
+                  "has_chronic_diagnosis")
+
+# Fixed function to check and print group counts using base R indexing for 
+#robustness
+check_lda_groups_fix <- function(df, feature) {
+  cat("\n--- Checking Feature:", feature, "---\n")
+  
+  # Group, count, and pivot to wide format
+  df_summary <- df %>%
+    group_by(churned, .data[[feature]]) %>%
+    summarise(n = n(), .groups = 'drop') %>%
+    pivot_wider(names_from = churned, values_from = n, values_fill = 0)
+  
+  # Standardize column names
+  names(df_summary)[names(df_summary) == "Retained"] <- "Not_Churned"
+  names(df_summary)[names(df_summary) == "Churned"] <- "Churned"
+  
+  df_summary <- df_summary %>%
+    mutate(
+      Total = Not_Churned + Churned,
+      Churn_Rate = round(Churned / Total, 3)
+    )
+  
+  # Simplified final selection using base R indexing [ ] to avoid dplyr 
+  #compatibility issues
+  df_final <- df_summary[, c(feature, "Not_Churned", "Churned", "Total", 
+                             "Churn_Rate")]
+  
+  print(df_final, n=Inf)
+}
+
+# Run the check for all key categorical features
+lapply(cat_features, check_lda_groups_fix, df = train_data)
+```
+
+## 14.1: Recode Sparse Categories to Fix Instability
+
+```{r}
+train_data_recoded <- train_data %>%
+  # Recode age_range 18-19 into 20-29
+  mutate(age_range_new = case_when(
+    age_range == "18-19" ~ "20-29",
+    TRUE ~ as.character(age_range)
+  )) %>%
+  
+  # Recode Housing Homeless into Lives With Others
+  mutate(Housing_new = case_when(
+    Housing == "Homeless" ~ "Lives With Others",
+    TRUE ~ as.character(Housing)
+  )) %>%
+  
+  # Recode Employment Seasonal into Unemployed
+  mutate(Employment_new = case_when(
+    Employment == "Seasonal" ~ "Unemployed (Actively Looking For Work)",
+    TRUE ~ as.character(Employment)
+  )) %>%
+  
+  # Convert new variables back to factors (critical for LDA)
+  mutate(
+    age_range_new = factor(age_range_new),
+    Housing_new = factor(Housing_new),
+    Employment_new = factor(Employment_new),
+    churned = as.factor(churned)
+  )
+
+train_data_recoded <- train_data_recoded %>%
+  mutate(Language_grouped = droplevels(Language_grouped))
+```
+
+## 14.2: Fit the LDA Model with Recoded Factors
+```{r}
+churn_lda_final_sdoh <- lda(
+  churned ~ Employment_new + 
+    has_chronic_diagnosis + 
+    age_range_new + 
+    Housing_new + 
+    Language_grouped,
+  data = train_data_recoded, 
+) # Final Model: SDoH-Only (Removing both continuous variables)
+
+
+# Print the LD1 coefficients
+print(churn_lda_final_sdoh)
+```
+
+## 14.3: LDA Coefficient Interpretation
+
+Based on the LD1 output from our linear discrinimant model,
+the strongest predictors for Churning (indicated by negative 
+coefficients) are age and employment status. Specifically, 
+being in the 65+ age range is the single most significant 
+driver of churn ($−1.75$), followed by Self-Employed ($−0.97$)
+and Unemployed ($−0.86$). This suggests that older individuals
+and those with less stable or traditional employment are 
+far more likely leave Lackey. Conversely, the strongest 
+predictorsfor Retention (indicated by positive coefficients) 
+are related to housing and language. Living in a Mobile Home
+($+1.65$) is the most powerful indicator of retention, 
+along with speaking non-English languages (Other at $+1.48$
+and Spanish at $+1.12$).
+
+# 15. VISUALS
+
+```{r}
+master_new <- master_new %>%
+  mutate(
+    # Create 3-month enrollment bins
+    enroll_bin = cut(
+      last_enrollment_end,
+      breaks = seq(
+        from = floor_date(min(last_enrollment_end, na.rm = TRUE), 
+                          unit = "month"),
+        to = ceiling_date(max(last_enrollment_end, na.rm = TRUE), 
+                          unit = "month") + months(4),
+        by = "4 months"
+      ),
+      include.lowest = TRUE,
+      right = FALSE
+    ),
+    # Create churn label, convert NA to "NA" string
+    churned_label = case_when(
+      churned == 1 ~ "Churned",
+      churned == 0 ~ "Not Churned",
+      is.na(churned) ~ "NA"
+    ),
+    churned_label = factor(churned_label, 
+                           levels = c("Not Churned", "Churned", "NA"))
+  )
+
+
+enroll_counts <- master_new %>%
+  group_by(enroll_bin, churned_label) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(enroll_counts, aes(x = enroll_bin, y = n, fill = churned_label)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = n), 
+            position = position_dodge(width = 0.9), vjust = -0.5) +
+  labs(
+    title = "Patients by Last Enrollment End (3-Month Bins) and Churn Status",
+    x = "Last Enrollment End (3-Month Bins)",
+    y = "Number of Patients",
+    fill = "Churn Status"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+table(master_new$churned)
+
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# Visualization of Churn Breakdown by our Churn Def
+
+# Age Range Plot
+train_data %>%
+  # Ensure age_range is ordered logically (optional, but good practice)
+  mutate(age_range = factor(age_range, levels = c("18-19", "20-29", "30-39", 
+                                                  "40-49", "50-59", "60-64", 
+                                                  "65+"))) %>%
+  
+  ggplot(aes(x = age_range, fill = factor(churned))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Churn Proportion by Age Range (Highest Risk Factor)",
+    y = "Proportion of Patients",
+    x = "Age Range",
+    fill = "Churned (1=Yes)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Housing Status Plot
+train_data %>%
+  # Filter out low-impact or non-significant housing groups if desired, or keep all
+  filter(Housing %in% c("Own", "Rent", "Lives With Others", "Homeless")) %>%
+  
+  ggplot(aes(x = Housing, fill = factor(churned))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Churn Proportion by Housing Status",
+    y = "Proportion of Patients",
+    x = "Housing Status",
+    fill = "Churned (1=Yes)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Employment Status Plot
+train_data %>%
+  # Filter to focus on the significant groups (Employed is reference)
+  filter(Employment %in% c("Employed", "Self Employed", 
+                           "Unemployed (Actively Looking For Work)")) %>%
+  
+  ggplot(aes(x = Employment, fill = factor(churned))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Churn Proportion by Key Employment Status",
+    y = "Proportion of Patients",
+    x = "Employment Status",
+    fill = "Churned (1=Yes)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Language Plot
+train_data %>%
+  # Filter to focus on the significant groups
+  filter(Language_grouped %in% c("English", "Spanish", "Other")) %>%
+  
+  ggplot(aes(x = Language_grouped, fill = factor(churned))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Churn Proportion by Language (Key Retention Factor)",
+    y = "Proportion of Patients",
+    x = "Language Group",
+    fill = "Churned (1=Yes)"
+  ) +
+  theme_minimal()
+
+# No-Show Rate vs Churn
+ggplot(train_data, aes(x = factor(churned), y = noshow_rate, 
+                       fill = factor(churned))) +
+  geom_boxplot(alpha = 0.7, outlier.colour = "red", outlier.shape = 1) +
+  labs(
+    title = "Distribution of No-Show Rates by Churn Status",
+    subtitle = "Do patients who miss appointments churn more often?",
+    x = "Churn Status (0 = Retained, 1 = Churned)",
+    y = "No-Show Rate (0 to 1)",
+    fill = "Churned"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent) # Formats Y axis as percentage
+
+# Distance vs Churn
+ggplot(train_data, aes(x = factor(churned), y = distance_meters, 
+                       fill = factor(churned))) +
+  geom_boxplot(alpha = 0.7) +
+  # scale_y_log10() + # Uncomment this line if outliers make the plot hard to read
+  labs(
+    title = "Distance from Clinic (Meters) by Churn Status",
+    x = "Churn Status",
+    y = "Distance (Meters)",
+    fill = "Churned"
+  ) +
+  theme_minimal()
+
+# Chronic Diagnosis vs Churn
+train_data %>%
+  # Filter out NAs if necessary, though your cleaning steps likely handled this
+  filter(!is.na(has_chronic_diagnosis)) %>%
+  
+  ggplot(aes(x = factor(has_chronic_diagnosis), fill = factor(churned))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_discrete(labels = c("0" = "No Chronic Condition", 
+                              "1" = "Has Chronic Condition")) +
+  labs(
+    title = "Churn Proportion by Chronic Condition Status",
+    subtitle = "Patients with chronic conditions are often 'stickier' (lower churn)",
+    y = "Proportion of Patients",
+    x = "Diagnosis Status",
+    fill = "Churned (1=Yes)"
+  ) +
+  theme_minimal()
+```
+
