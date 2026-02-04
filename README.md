@@ -27,7 +27,8 @@ This definition aligns with preventative care guidelines and the clinic’s oper
 ## Data & Feature Engineering
 De-identified patient-level data included demographics, diagnoses, enrollment status, and
 visit history. Multiple raw datasets were cleaned and joined to create a unified analytic
-table.
+table. Even though the data has been de-identified, it will not be available due to ethical 
+considerations regarding data privacy and to ensure compliance with data protection regulations (such as HIPAA).
 
 Feature engineering included:
 - Aggregated visit and diagnosis indicators
